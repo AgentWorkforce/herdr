@@ -55,11 +55,6 @@ export function summarizeSnapshot(snapshot, workspaceIds) {
   return { workspaceIds: [...allowed], agents, statuses };
 }
 
-export function formatSessionSummary(summary) {
-  const { statuses } = summary;
-  return `Herdr summary: ${summary.agents} agents across ${summary.workspaceIds.length} workspaces — working ${statuses.working}, blocked ${statuses.blocked}, idle ${statuses.idle}, done ${statuses.done}, unknown ${statuses.unknown}.`;
-}
-
 export function normalizeStatusEvent(message, workspaceIds) {
   const data = message?.data;
   if (
@@ -210,14 +205,17 @@ export function registerSessionSummaryAction(agent, socketPath, workspaceIds) {
     description: 'Return aggregate Herdr agent status counts for the configured workspaces.',
     input: SUMMARY_INPUT,
     output: SUMMARY_OUTPUT,
-    handler: async ({ agent: caller }) => {
+    handler: async () => {
       const snapshot = sessionSnapshotFrom(await requestHerdr(socketPath, 'session.snapshot'));
-      const summary = summarizeSnapshot(snapshot, workspaceIds);
-      const recipient = caller.handle ?? caller.name;
-      await agent.sendMessage({ to: `@${recipient}`, text: formatSessionSummary(summary) });
-      return summary;
+      return summarizeSnapshot(snapshot, workspaceIds);
     },
   });
+}
+
+export function installStopHandlers(target, stop) {
+  target.once('SIGINT', stop);
+  target.once('SIGTERM', stop);
+  if (target.platform !== 'win32') target.once('SIGHUP', stop);
 }
 
 export async function startBridge({
@@ -237,11 +235,13 @@ export async function startBridge({
   const cleanup = async () => {
     const errors = [];
     for (const step of [
-      () => action?.unregister(),
       () => subscriptions?.stop(),
+      // Herdr escalates pane shutdown quickly after SIGHUP. Release the local
+      // singleton lock before any remote unregister or delivery can delay it.
+      () => lock.release(),
+      () => action?.unregister(),
       () => Promise.allSettled(deliveries),
       () => persistState?.flush(),
-      () => lock.release(),
     ]) {
       try {
         await step();
@@ -308,14 +308,21 @@ export async function startBridge({
 }
 
 async function main() {
-  const bridge = await startBridge();
-  const stop = () =>
-    void bridge.stop().catch((error) => {
-      console.error(`Agent Relay bridge failed to stop cleanly: ${error.message}`);
-      process.exitCode = 1;
-    });
-  process.once('SIGINT', stop);
-  process.once('SIGTERM', stop);
+  const bridge = startBridge();
+  let stopping = false;
+  const stop = () => {
+    if (stopping) return;
+    stopping = true;
+    void bridge.then((active) => active.stop()).then(
+      () => process.exit(0),
+      (error) => {
+        console.error(`Agent Relay bridge failed to stop cleanly: ${error.message}`);
+        process.exit(1);
+      }
+    );
+  };
+  installStopHandlers(process, stop);
+  await bridge;
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

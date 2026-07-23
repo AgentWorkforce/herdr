@@ -7,6 +7,7 @@ import test from 'node:test';
 
 import {
   bridgeName,
+  installStopHandlers,
   normalizeStatusEvent,
   prepareTransition,
   rollbackTransition,
@@ -28,6 +29,25 @@ const snapshot = {
     { pane_id: 'w2:p1', workspace_id: 'w2' },
   ],
 };
+
+test('installs the pane hangup stop handler on Unix', () => {
+  const installedSignals = (platform) => {
+    const signals = [];
+    installStopHandlers(
+      {
+        platform,
+        once(signal) {
+          signals.push(signal);
+        },
+      },
+      () => {}
+    );
+    return signals;
+  };
+
+  assert.deepEqual(installedSignals('darwin'), ['SIGINT', 'SIGTERM', 'SIGHUP']);
+  assert.deepEqual(installedSignals('win32'), ['SIGINT', 'SIGTERM']);
+});
 
 async function eventually(assertion, attempts = 50) {
   let lastError;
@@ -181,6 +201,23 @@ test('rejects exposed credential files and duplicate bridge processes', async ()
   });
 });
 
+test('recovers a bridge lock whose owner process has stopped', async () => {
+  await withTemporaryDirectory(async (directory) => {
+    await mkdir(directory, { recursive: true });
+    await writeFile(
+      lockPath(directory),
+      `${JSON.stringify({ pid: 2_147_483_647, nonce: 'stale' })}\n`,
+      { mode: 0o600 }
+    );
+
+    const lock = await acquireBridgeLock(directory);
+    const owner = JSON.parse(await readFile(lockPath(directory), 'utf8'));
+    assert.equal(owner.pid, process.pid);
+    await lock.release();
+    await assert.rejects(stat(lockPath(directory)), { code: 'ENOENT' });
+  });
+});
+
 test('uses the interprocess-compatible Windows pipe name', () => {
   assert.equal(localSocketTarget('C:\\Users\\me\\herdr.sock', 'win32'), '\\\\.\\pipe\\C:\\Users\\me\\herdr.sock');
   assert.equal(localSocketTarget('\\\\.\\pipe\\herdr.sock', 'win32'), '\\\\.\\pipe\\herdr.sock');
@@ -291,11 +328,13 @@ test('refreshes per-pane subscriptions without replaying historical lifecycle ev
     await new Promise((resolve) => setTimeout(resolve, 1_100));
     assert.equal(requests.filter((request) => request.method === 'events.subscribe').length, 2);
 
-    const result = await actions[0].handler({ input: {}, agent: { name: 'viewer' } });
+    // Action results are returned through Relay's invocation output. Do not
+    // depend on the transport event's caller label being a routable DM handle.
+    const result = await actions[0].handler({ input: {}, agent: { name: 'node' } });
     assert.equal(result.agents, 2);
     assert.equal(actions[0].input.safeParse({ unexpected: true }).success, false);
     assert.equal(actions[0].output.safeParse(result).success, true);
-    assert.equal(sent[1].to, '@viewer');
+    assert.equal(sent.length, 1);
     await eventually(async () => {
       const contents = await readFile(join(stateDir, 'relay-state.json'), 'utf8');
       assert.match(contents, /at_live_bridge/);

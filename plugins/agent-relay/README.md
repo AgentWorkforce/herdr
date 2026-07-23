@@ -58,7 +58,7 @@ The Relay agent token and status-transition dedupe state are stored only in
 inherits the account-scoped ACL of Herdr's plugin state directory. Subsequent
 starts reconnect with that token rather than registering another Relay agent.
 An exclusive state-directory lock prevents two bridge panes from racing to
-rotate that token. If the bridge process crashes, verify that it has stopped
-before removing the reported stale `relay-bridge.lock` file.
+rotate that token. A later start removes the lock automatically when its owner
+PID is no longer running; live or unidentifiable lock owners still fail closed.
 The configuration file belongs in `HERDR_PLUGIN_CONFIG_DIR`; do not commit a
 real workspace key.

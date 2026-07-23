@@ -41,6 +41,15 @@ async function assertPrivateStateFile(path) {
   }
 }
 
+function processIsAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
+  }
+}
+
 export async function acquireBridgeLock(stateDir) {
   await prepareStateDirectory(stateDir);
   const target = lockPath(stateDir);
@@ -62,6 +71,10 @@ export async function acquireBridgeLock(stateDir) {
       owner = JSON.parse(await readFile(target, 'utf8'));
     } catch {
       owner = undefined;
+    }
+    if (Number.isInteger(owner?.pid) && !processIsAlive(owner.pid)) {
+      await unlink(target);
+      return acquireBridgeLock(stateDir);
     }
     const suffix = Number.isInteger(owner?.pid) ? ` (PID ${owner.pid})` : '';
     throw new Error(
