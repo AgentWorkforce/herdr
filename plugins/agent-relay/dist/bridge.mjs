@@ -6,9 +6,24 @@ import { z } from 'zod';
 
 import { loadBridgeConfig, pluginPaths } from './config.mjs';
 import { requestHerdr, subscribeToBridgeEvents } from './herdr-socket.mjs';
-import { loadBridgeState, saveBridgeState } from './state.mjs';
+import { acquireBridgeLock, loadBridgeState, saveBridgeState } from './state.mjs';
 
 const SUMMARY_INPUT = z.object({}).strict();
+const SUMMARY_OUTPUT = z
+  .object({
+    workspaceIds: z.array(z.string()),
+    agents: z.number().int().nonnegative(),
+    statuses: z
+      .object({
+        idle: z.number().int().nonnegative(),
+        working: z.number().int().nonnegative(),
+        blocked: z.number().int().nonnegative(),
+        done: z.number().int().nonnegative(),
+        unknown: z.number().int().nonnegative(),
+      })
+      .strict(),
+  })
+  .strict();
 const STATUS_VALUES = new Set(['idle', 'working', 'blocked', 'done', 'unknown']);
 
 function hash(value) {
@@ -73,8 +88,23 @@ export function prepareTransition(state, event) {
   state.transitions[event.paneId] = { fingerprint, sequence };
   return {
     ...event,
+    previousTransition: previous,
+    transitionFingerprint: fingerprint,
+    transitionSequence: sequence,
     idempotencyKey: `herdr-status-${hash(`${event.paneId}\u0000${sequence}\u0000${fingerprint}`)}`,
   };
+}
+
+export function rollbackTransition(state, transition) {
+  const current = state.transitions[transition.paneId];
+  if (
+    current?.fingerprint !== transition.transitionFingerprint ||
+    current.sequence !== transition.transitionSequence
+  ) {
+    return;
+  }
+  if (transition.previousTransition) state.transitions[transition.paneId] = transition.previousTransition;
+  else delete state.transitions[transition.paneId];
 }
 
 export function formatStatusMessage(event) {
@@ -83,14 +113,16 @@ export function formatStatusMessage(event) {
 
 function stateWriter(stateDir, state) {
   let pending = Promise.resolve();
-  return () => {
+  const write = () => {
     pending = pending.catch(() => undefined).then(() => saveBridgeState(stateDir, state));
     return pending;
   };
+  write.flush = () => pending;
+  return write;
 }
 
 function isPaneLifecycleEvent(message) {
-  return ['pane.created', 'pane.closed', 'pane.moved', 'workspace.closed'].includes(message?.event);
+  return ['pane_created', 'pane_closed', 'pane_moved', 'workspace_closed'].includes(message?.event);
 }
 
 function createSubscriptionManager({ socketPath, workspaceIds, onStatus, logger }) {
@@ -155,16 +187,19 @@ async function connectRelay(config, state, socketPath, AgentRelayCtor) {
   const options = { workspaceKey: config.workspaceKey };
   if (config.baseUrl) options.baseUrl = config.baseUrl;
   const relay = new AgentRelayCtor(options);
+  let agent;
   if (state.apiToken) {
-    return { agent: await relay.workspace.reconnect({ apiToken: state.apiToken }) };
+    agent = await relay.workspace.reconnect({ apiToken: state.apiToken });
+  } else {
+    agent = await relay.workspace.register({
+      name: bridgeName(socketPath),
+      type: 'agent',
+      metadata: { integration: 'herdr' },
+    });
+    if (!agent.token) throw new Error('Agent Relay registration did not return an agent token');
+    state.apiToken = agent.token;
   }
-  const agent = await relay.workspace.register({
-    name: bridgeName(socketPath),
-    type: 'agent',
-    metadata: { integration: 'herdr' },
-  });
-  if (!agent.token) throw new Error('Agent Relay registration did not return an agent token');
-  state.apiToken = agent.token;
+  await agent.channels.join(config.channel);
   return { agent };
 }
 
@@ -173,6 +208,7 @@ export function registerSessionSummaryAction(agent, socketPath, workspaceIds) {
     name: 'herdr.session_summary',
     description: 'Return aggregate Herdr agent status counts for the configured workspaces.',
     input: SUMMARY_INPUT,
+    output: SUMMARY_OUTPUT,
     handler: async ({ agent: caller }) => {
       const snapshot = sessionSnapshotFrom(await requestHerdr(socketPath, 'session.snapshot'));
       const summary = summarizeSnapshot(snapshot, workspaceIds);
@@ -192,48 +228,91 @@ export async function startBridge({
   const socketPath = environment.HERDR_SOCKET_PATH;
   if (!socketPath) throw new Error('Herdr did not provide HERDR_SOCKET_PATH');
 
-  const config = await loadBridgeConfig(configDir);
-  const workspaceIds = new Set(config.workspaceIds);
-  const state = await loadBridgeState(stateDir);
-  const persistState = stateWriter(stateDir, state);
+  const lock = await acquireBridgeLock(stateDir);
+  let action;
+  let subscriptions;
+  let persistState;
+  const deliveries = new Set();
+  const cleanup = async () => {
+    const errors = [];
+    for (const step of [
+      () => action?.unregister(),
+      () => subscriptions?.stop(),
+      () => Promise.allSettled(deliveries),
+      () => persistState?.flush(),
+      () => lock.release(),
+    ]) {
+      try {
+        await step();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length) throw new AggregateError(errors, 'Agent Relay bridge cleanup failed');
+  };
+  try {
+    const config = await loadBridgeConfig(configDir);
+    const workspaceIds = new Set(config.workspaceIds);
+    const state = await loadBridgeState(stateDir);
+    persistState = stateWriter(stateDir, state);
 
-  await requestHerdr(socketPath, 'ping');
+    await requestHerdr(socketPath, 'ping');
 
-  const { agent } = await connectRelay(config, state, socketPath, AgentRelayCtor);
-  await persistState();
-  const action = registerSessionSummaryAction(agent, socketPath, config.workspaceIds);
-  const subscriptions = createSubscriptionManager({
-    socketPath,
-    workspaceIds,
-    logger,
-    onStatus(message) {
-      const event = normalizeStatusEvent(message, workspaceIds);
-      if (!event) return;
-      const transition = prepareTransition(state, event);
-      if (!transition) return;
-      void agent
-        .sendMessage({
-          to: config.channel,
-          text: formatStatusMessage(transition),
-          idempotencyKey: transition.idempotencyKey,
-        })
-        .then(() => persistState())
-        .catch(() => logger.warn('Agent Relay bridge could not forward a Herdr status update'));
-    },
-  });
-  await subscriptions.start();
+    const { agent } = await connectRelay(config, state, socketPath, AgentRelayCtor);
+    await persistState();
+    action = registerSessionSummaryAction(agent, socketPath, config.workspaceIds);
+    subscriptions = createSubscriptionManager({
+      socketPath,
+      workspaceIds,
+      logger,
+      onStatus(message) {
+        const event = normalizeStatusEvent(message, workspaceIds);
+        if (!event) return;
+        const transition = prepareTransition(state, event);
+        if (!transition) return;
+        const delivery = agent
+          .sendMessage({
+            to: config.channel,
+            text: formatStatusMessage(transition),
+            idempotencyKey: transition.idempotencyKey,
+          })
+          .then(
+            () =>
+              persistState().catch(() =>
+                logger.warn('Agent Relay bridge forwarded a status update but could not persist its dedupe state')
+              ),
+            () => {
+              rollbackTransition(state, transition);
+              logger.warn('Agent Relay bridge could not forward a Herdr status update');
+            }
+          );
+        deliveries.add(delivery);
+        void delivery.finally(() => deliveries.delete(delivery));
+      },
+    });
+    await subscriptions.start();
+  } catch (error) {
+    await cleanup().catch(() => logger.warn('Agent Relay bridge cleanup failed during startup'));
+    throw error;
+  }
 
+  let stopped = false;
   return {
-    stop() {
-      action.unregister();
-      subscriptions.stop();
+    async stop() {
+      if (stopped) return;
+      stopped = true;
+      await cleanup();
     },
   };
 }
 
 async function main() {
   const bridge = await startBridge();
-  const stop = () => bridge.stop();
+  const stop = () =>
+    void bridge.stop().catch((error) => {
+      console.error(`Agent Relay bridge failed to stop cleanly: ${error.message}`);
+      process.exitCode = 1;
+    });
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);
 }

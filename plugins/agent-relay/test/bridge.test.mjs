@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,11 +9,13 @@ import {
   bridgeName,
   normalizeStatusEvent,
   prepareTransition,
+  rollbackTransition,
   startBridge,
   summarizeSnapshot,
 } from '../dist/bridge.mjs';
-import { loadBridgeConfig, redactConfig } from '../dist/config.mjs';
+import { BridgeConfigSchema, loadBridgeConfig, redactConfig } from '../dist/config.mjs';
 import { localSocketTarget } from '../dist/herdr-socket.mjs';
+import { acquireBridgeLock, loadBridgeState, lockPath } from '../dist/state.mjs';
 
 const snapshot = {
   agents: [
@@ -78,7 +80,7 @@ async function fakeHerdrServer(socketPath, { dynamicPane = true, disconnectFirst
               };
               socket.write(
                 `${JSON.stringify({
-                  event: 'pane.created',
+                  event: 'pane_created',
                   data: { pane: { pane_id: 'w1:p2', workspace_id: 'w1' } },
                 })}\n`
               );
@@ -99,7 +101,7 @@ async function fakeHerdrServer(socketPath, { dynamicPane = true, disconnectFirst
       }
     });
   });
-  await new Promise((resolve) => server.listen(socketPath, resolve));
+  await new Promise((resolve) => server.listen(localSocketTarget(socketPath), resolve));
   return { requests, server };
 }
 
@@ -107,8 +109,10 @@ async function writeConfig(configDir) {
   await mkdir(configDir, { recursive: true });
   await writeFile(
     join(configDir, 'agent-relay.json'),
-    JSON.stringify({ workspaceKey: 'rk_live_secret', channel: '#agent-status', workspaceIds: ['w1'] })
+    JSON.stringify({ workspaceKey: 'rk_live_secret', channel: '#agent-status', workspaceIds: ['w1'] }),
+    { mode: 0o600 }
   );
+  if (process.platform !== 'win32') await chmod(join(configDir, 'agent-relay.json'), 0o600);
 }
 
 test('validates configuration and redacts workspace credentials', async () => {
@@ -117,6 +121,56 @@ test('validates configuration and redacts workspace credentials', async () => {
     const config = await loadBridgeConfig(directory);
     assert.equal(redactConfig(config).workspaceKey, '[redacted]');
     assert.equal(config.channel, '#agent-status');
+    assert.equal(
+      BridgeConfigSchema.safeParse({
+        workspaceKey: 'rk_live_secret',
+        baseUrl: 'http://relay.example.com',
+        channel: '#agent-status',
+        workspaceIds: ['w1'],
+      }).success,
+      false
+    );
+    assert.equal(
+      BridgeConfigSchema.safeParse({
+        workspaceKey: 'rk_live_secret',
+        baseUrl: 'http://127.0.0.1:3000',
+        channel: '#agent-status',
+        workspaceIds: ['w1'],
+      }).success,
+      true
+    );
+    assert.equal(
+      BridgeConfigSchema.safeParse({
+        workspaceKey: 'rk_live_secret',
+        baseUrl: 'not-a-url',
+        channel: '#agent-status',
+        workspaceIds: ['w1'],
+      }).success,
+      false
+    );
+  });
+});
+
+test('rejects exposed credential files and duplicate bridge processes', async () => {
+  await withTemporaryDirectory(async (directory) => {
+    const configDir = join(directory, 'config');
+    const stateDir = join(directory, 'state');
+    await writeConfig(configDir);
+    if (process.platform !== 'win32') {
+      await chmod(join(configDir, 'agent-relay.json'), 0o644);
+      await assert.rejects(loadBridgeConfig(configDir), /must not be accessible/);
+      await chmod(join(configDir, 'agent-relay.json'), 0o600);
+
+      await mkdir(stateDir, { recursive: true });
+      await writeFile(join(stateDir, 'relay-state.json'), JSON.stringify({ transitions: {} }), { mode: 0o644 });
+      await assert.rejects(loadBridgeState(stateDir), /must not be accessible/);
+      await chmod(join(stateDir, 'relay-state.json'), 0o600);
+    }
+
+    const first = await acquireBridgeLock(stateDir);
+    await assert.rejects(acquireBridgeLock(stateDir), /Another Agent Relay bridge holds/);
+    await first.release();
+    await assert.rejects(stat(lockPath(stateDir)), { code: 'ENOENT' });
   });
 });
 
@@ -134,6 +188,20 @@ test('deduplicates identical status events while preserving later repeated state
   assert.match(prepareTransition(state, blocked).idempotencyKey, /^herdr-status-/);
   assert.match(prepareTransition(state, working).idempotencyKey, /^herdr-status-/);
   assert.equal(state.transitions['w1:p1'].sequence, 3);
+});
+
+test('rolls back a failed transition so the same status can be retried', () => {
+  const state = { transitions: {} };
+  const event = { paneId: 'w1:p1', workspaceId: 'w1', agent: 'codex', status: 'working' };
+  const transition = prepareTransition(state, event);
+  rollbackTransition(state, transition);
+  assert.deepEqual(state.transitions, {});
+  assert.equal(prepareTransition(state, event).idempotencyKey, transition.idempotencyKey);
+
+  const superseded = prepareTransition(state, { ...event, status: 'blocked' });
+  rollbackTransition(state, transition);
+  assert.equal(state.transitions['w1:p1'].fingerprint, superseded.transitionFingerprint);
+  assert.equal(state.transitions['w1:p1'].sequence, superseded.transitionSequence);
 });
 
 test('filters status events and summarizes only configured workspaces', () => {
@@ -164,6 +232,11 @@ test('rebuilds per-pane subscriptions after a pane is created and forwards its s
     let registrations = 0;
     const client = {
       token: 'at_live_bridge',
+      channels: {
+        async join(channel) {
+          assert.equal(channel, '#agent-status');
+        },
+      },
       registerAction(definition) {
         actions.push(definition);
         return { unregister() {} };
@@ -214,17 +287,21 @@ test('rebuilds per-pane subscriptions after a pane is created and forwards its s
     assert.match(sent[0].text, /w1\/w1:p2 codex is working/);
     assert.match(sent[0].idempotencyKey, /^herdr-status-/);
 
-    const result = await actions[0].handler({ input: {}, agent: { handle: 'viewer' } });
+    const result = await actions[0].handler({ input: {}, agent: { name: 'viewer' } });
     assert.equal(result.agents, 2);
+    assert.equal(actions[0].input.safeParse({ unexpected: true }).success, false);
+    assert.equal(actions[0].output.safeParse(result).success, true);
     assert.equal(sent[1].to, '@viewer');
     await eventually(async () => {
       const contents = await readFile(join(stateDir, 'relay-state.json'), 'utf8');
       assert.match(contents, /at_live_bridge/);
     });
-    const permissions = (await stat(join(stateDir, 'relay-state.json'))).mode & 0o777;
-    assert.equal(permissions, 0o600);
+    if (process.platform !== 'win32') {
+      const permissions = (await stat(join(stateDir, 'relay-state.json'))).mode & 0o777;
+      assert.equal(permissions, 0o600);
+    }
 
-    bridge.stop();
+    await bridge.stop();
     await new Promise((resolve) => server.close(resolve));
     await unlink(socketPath).catch(() => {});
   });
@@ -237,10 +314,16 @@ test('reconnects from the persisted bridge token without registering again', asy
     const socketPath = join(directory, 'herdr.sock');
     await writeConfig(configDir);
     await mkdir(stateDir, { recursive: true });
-    await writeFile(join(stateDir, 'relay-state.json'), JSON.stringify({ apiToken: 'at_live_saved', transitions: {} }));
+    await writeFile(join(stateDir, 'relay-state.json'), JSON.stringify({ apiToken: 'at_live_saved', transitions: {} }), {
+      mode: 0o600,
+    });
     const { server } = await fakeHerdrServer(socketPath, { dynamicPane: false });
     const reconnects = [];
-    const client = { registerAction: () => ({ unregister() {} }), sendMessage: async () => {} };
+    const client = {
+      channels: { join: async () => {} },
+      registerAction: () => ({ unregister() {} }),
+      sendMessage: async () => {},
+    };
     class ReconnectRelay {
       constructor() {
         this.workspace = {
@@ -263,7 +346,7 @@ test('reconnects from the persisted bridge token without registering again', asy
     assert.deepEqual(reconnects, ['at_live_saved']);
     assert.equal(bridgeName('/tmp/herdr.sock'), bridgeName('/tmp/herdr.sock'));
     assert.notEqual(bridgeName('/tmp/herdr.sock'), bridgeName('/tmp/other.sock'));
-    bridge.stop();
+    await bridge.stop();
     await new Promise((resolve) => server.close(resolve));
     await unlink(socketPath).catch(() => {});
   });
@@ -281,6 +364,7 @@ test('resubscribes after its Herdr subscription connection closes', async () => 
     });
     const client = {
       token: 'at_live_bridge',
+      channels: { join: async () => {} },
       registerAction: () => ({ unregister() {} }),
       sendMessage: async () => {},
     };
@@ -296,7 +380,7 @@ test('resubscribes after its Herdr subscription connection closes', async () => 
       logger: { warn() {} },
     });
     await eventually(() => assert.equal(requests.filter((request) => request.method === 'events.subscribe').length, 2), 150);
-    bridge.stop();
+    await bridge.stop();
     await new Promise((resolve) => server.close(resolve));
     await unlink(socketPath).catch(() => {});
   });
