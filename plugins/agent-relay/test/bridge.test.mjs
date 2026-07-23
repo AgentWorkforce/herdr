@@ -51,7 +51,10 @@ async function withTemporaryDirectory(run) {
   }
 }
 
-async function fakeHerdrServer(socketPath, { dynamicPane = true, disconnectFirstSubscription = false } = {}) {
+async function fakeHerdrServer(
+  socketPath,
+  { dynamicPane = true, disconnectFirstSubscription = false, replayLifecycle = false } = {}
+) {
   const requests = [];
   let currentSnapshot = structuredClone(snapshot);
   let subscriptions = 0;
@@ -72,14 +75,16 @@ async function fakeHerdrServer(socketPath, { dynamicPane = true, disconnectFirst
         } else if (request.method === 'events.subscribe') {
           socket.write(`${JSON.stringify({ id: request.id, result: { type: 'subscribed' } })}\n`);
           subscriptions += 1;
-          queueMicrotask(() => {
-            socket.write(
-              `${JSON.stringify({
-                event: 'pane_created',
-                data: { pane: { pane_id: 'historical:pane', workspace_id: 'w1' } },
-              })}\n`
-            );
-          });
+          if (replayLifecycle) {
+            queueMicrotask(() => {
+              socket.write(
+                `${JSON.stringify({
+                  event: 'pane_created',
+                  data: { pane: { pane_id: 'historical:pane', workspace_id: 'w1' } },
+                })}\n`
+              );
+            });
+          }
           if (dynamicPane && subscriptions === 1) {
             queueMicrotask(() => {
               currentSnapshot = {
@@ -228,7 +233,7 @@ test('refreshes per-pane subscriptions without replaying historical lifecycle ev
     const stateDir = join(directory, 'state');
     const socketPath = join(directory, 'herdr.sock');
     await writeConfig(configDir);
-    const { server, requests } = await fakeHerdrServer(socketPath);
+    const { server, requests } = await fakeHerdrServer(socketPath, { replayLifecycle: true });
     const sent = [];
     const actions = [];
     let registrations = 0;
