@@ -1,0 +1,50 @@
+name: Agent Relay Plugin
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/agent-relay-plugin.yml"
+      - "plugins/agent-relay/**"
+  push:
+    branches: [master]
+    paths:
+      - ".github/workflows/agent-relay-plugin.yml"
+      - "plugins/agent-relay/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-relay-plugin-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: plugins/agent-relay
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Node.js 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: plugins/agent-relay/package-lock.json
+
+      - name: Install production dependencies
+        run: npm ci --omit=dev
+
+      - name: Run plugin tests
+        run: npm test
