@@ -1641,6 +1641,9 @@ impl App {
                         self.update_host_terminal_theme(kind, color);
                     }
                 }
+                crate::raw_input::RawInputEvent::HostPaletteColor { index, color } => {
+                    let _ = (index, color);
+                }
                 crate::raw_input::RawInputEvent::HostColorSchemeChanged(appearance) => {
                     if apply_host_terminal_theme {
                         self.set_host_terminal_appearance(appearance, true);

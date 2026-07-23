@@ -69,6 +69,27 @@ impl App {
             return;
         }
 
+        if let AppEvent::HostPaletteQueries { pane_id, queries } = ev {
+            let terminal_id = self
+                .state
+                .workspaces
+                .iter()
+                .find_map(|workspace| workspace.terminal_id(pane_id).cloned());
+            if let Some(runtime) = terminal_id
+                .as_ref()
+                .and_then(|terminal_id| self.terminal_runtimes.get(terminal_id))
+            {
+                for query in queries {
+                    let _ = runtime.try_send_palette_response(
+                        query.index,
+                        query.revision,
+                        bytes::Bytes::from(query.fallback),
+                    );
+                }
+            }
+            return;
+        }
+
         if let AppEvent::PrefixInputSource { active } = ev {
             // Monolithic path applies the switch here. Server mode forwards it to the foreground
             // client instead (see HeadlessServer::handle_internal_event_with_forwarding); should an

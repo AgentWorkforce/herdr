@@ -45,6 +45,10 @@ mod windows {
 
     enum PtyIoControlCommand {
         Resize(PtyResizeRequest),
+        WritePaletteResponse {
+            bytes: Bytes,
+            validate: Box<dyn FnOnce() -> bool + Send>,
+        },
         Shutdown,
     }
 
@@ -110,6 +114,24 @@ mod windows {
                 *accepting = false;
             }
             let _ = self.control_tx.send(PtyIoControlCommand::Shutdown);
+        }
+
+        pub(crate) fn try_write_palette_response(
+            &self,
+            bytes: Bytes,
+            validate: Box<dyn FnOnce() -> bool + Send>,
+        ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+            match self
+                .control_tx
+                .send(PtyIoControlCommand::WritePaletteResponse { bytes, validate })
+            {
+                Ok(()) => Ok(()),
+                Err(std_mpsc::SendError(PtyIoControlCommand::WritePaletteResponse {
+                    bytes,
+                    ..
+                })) => Err(mpsc::error::TrySendError::Closed(bytes)),
+                Err(_) => unreachable!("palette response send returned a different command"),
+            }
         }
     }
 
@@ -195,6 +217,11 @@ mod windows {
                                     if write_all_locked(&writer, &response).is_err() {
                                         break;
                                     }
+                                }
+                            }
+                            PtyIoControlCommand::WritePaletteResponse { bytes, validate } => {
+                                if validate() {
+                                    let _ = write_all_locked(&writer, &bytes);
                                 }
                             }
                             PtyIoControlCommand::Shutdown => break,
