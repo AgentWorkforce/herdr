@@ -72,18 +72,20 @@ async function fakeHerdrServer(socketPath, { dynamicPane = true, disconnectFirst
         } else if (request.method === 'events.subscribe') {
           socket.write(`${JSON.stringify({ id: request.id, result: { type: 'subscribed' } })}\n`);
           subscriptions += 1;
+          queueMicrotask(() => {
+            socket.write(
+              `${JSON.stringify({
+                event: 'pane_created',
+                data: { pane: { pane_id: 'historical:pane', workspace_id: 'w1' } },
+              })}\n`
+            );
+          });
           if (dynamicPane && subscriptions === 1) {
             queueMicrotask(() => {
               currentSnapshot = {
                 ...currentSnapshot,
                 panes: [...currentSnapshot.panes, { pane_id: 'w1:p2', workspace_id: 'w1' }],
               };
-              socket.write(
-                `${JSON.stringify({
-                  event: 'pane_created',
-                  data: { pane: { pane_id: 'w1:p2', workspace_id: 'w1' } },
-                })}\n`
-              );
             });
           } else if (dynamicPane && subscriptions === 2) {
             queueMicrotask(() => {
@@ -220,7 +222,7 @@ test('filters status events and summarizes only configured workspaces', () => {
   });
 });
 
-test('rebuilds per-pane subscriptions after a pane is created and forwards its status', async () => {
+test('refreshes per-pane subscriptions without replaying historical lifecycle events', async () => {
   await withTemporaryDirectory(async (directory) => {
     const configDir = join(directory, 'config');
     const stateDir = join(directory, 'state');
@@ -265,27 +267,24 @@ test('rebuilds per-pane subscriptions after a pane is created and forwards its s
       AgentRelayCtor: FakeRelay,
       logger: { warn() {} },
     });
-    await eventually(() => assert.equal(requests.filter((request) => request.method === 'events.subscribe').length, 2));
+    await eventually(
+      () => assert.equal(requests.filter((request) => request.method === 'events.subscribe').length, 2),
+      150
+    );
     await eventually(() => assert.equal(sent.length, 1));
     assert.equal(registrations, 1);
     assert.deepEqual(requests.filter((request) => request.method === 'events.subscribe')[0].params.subscriptions, [
-      { type: 'pane.created' },
-      { type: 'pane.closed' },
-      { type: 'pane.moved' },
-      { type: 'workspace.closed' },
       { type: 'pane.agent_status_changed', pane_id: 'w1:p1' },
     ]);
     assert.deepEqual(requests.filter((request) => request.method === 'events.subscribe')[1].params.subscriptions, [
-      { type: 'pane.created' },
-      { type: 'pane.closed' },
-      { type: 'pane.moved' },
-      { type: 'workspace.closed' },
       { type: 'pane.agent_status_changed', pane_id: 'w1:p1' },
       { type: 'pane.agent_status_changed', pane_id: 'w1:p2' },
     ]);
     assert.equal(sent[0].to, '#agent-status');
     assert.match(sent[0].text, /w1\/w1:p2 codex is working/);
     assert.match(sent[0].idempotencyKey, /^herdr-status-/);
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    assert.equal(requests.filter((request) => request.method === 'events.subscribe').length, 2);
 
     const result = await actions[0].handler({ input: {}, agent: { name: 'viewer' } });
     assert.equal(result.agents, 2);

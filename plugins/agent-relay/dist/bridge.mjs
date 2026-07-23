@@ -121,23 +121,22 @@ function stateWriter(stateDir, state) {
   return write;
 }
 
-function isPaneLifecycleEvent(message) {
-  return ['pane_created', 'pane_closed', 'pane_moved', 'workspace_closed'].includes(message?.event);
-}
-
 function createSubscriptionManager({ socketPath, workspaceIds, onStatus, logger }) {
   let active;
+  let activePaneKey;
   let stopped = false;
   let pending = Promise.resolve();
-  let reconnectTimer;
+  let refreshTimer;
 
-  const scheduleRebuild = () => {
-    if (stopped || reconnectTimer) return;
-    reconnectTimer = setTimeout(() => {
-      reconnectTimer = undefined;
+  // Generic Herdr lifecycle subscriptions replay retained events from sequence
+  // zero. Snapshot polling avoids treating that history as a fresh pane change.
+  const scheduleRefresh = () => {
+    if (stopped || refreshTimer) return;
+    refreshTimer = setTimeout(() => {
+      refreshTimer = undefined;
       void rebuild().catch(() => {
-        logger.warn('Agent Relay bridge could not reconnect to Herdr');
-        scheduleRebuild();
+        logger.warn('Agent Relay bridge could not refresh its Herdr subscriptions');
+        scheduleRefresh();
       });
     }, 1_000);
   };
@@ -148,25 +147,27 @@ function createSubscriptionManager({ socketPath, workspaceIds, onStatus, logger 
       const snapshot = sessionSnapshotFrom(await requestHerdr(socketPath, 'session.snapshot'));
       const paneIds = snapshot.panes
         .filter((pane) => workspaceIds.has(pane.workspace_id))
-        .map((pane) => pane.pane_id);
-      const next = await subscribeToBridgeEvents(socketPath, paneIds, (message) => {
-        if (isPaneLifecycleEvent(message)) {
-          void rebuild().catch(() => scheduleRebuild());
-          return;
-        }
-        onStatus(message);
-      });
+        .map((pane) => pane.pane_id)
+        .sort();
+      const paneKey = paneIds.join('\u0000');
+      if (active && !active.closed && paneKey === activePaneKey) {
+        scheduleRefresh();
+        return;
+      }
+      const next = await subscribeToBridgeEvents(socketPath, paneIds, onStatus);
       if (stopped) {
         next.close();
         return;
       }
       const previous = active;
       active = next;
+      activePaneKey = paneKey;
       next.once('closed', () => {
-        if (active === next && !stopped) scheduleRebuild();
+        if (active === next && !stopped) scheduleRefresh();
       });
-      if (next.closed) scheduleRebuild();
+      if (next.closed) scheduleRefresh();
       previous?.close();
+      scheduleRefresh();
     });
     return pending;
   };
@@ -177,7 +178,7 @@ function createSubscriptionManager({ socketPath, workspaceIds, onStatus, logger 
     },
     stop() {
       stopped = true;
-      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (refreshTimer) clearTimeout(refreshTimer);
       active?.close();
     },
   };

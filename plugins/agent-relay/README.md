@@ -6,6 +6,8 @@ channel and exposes a read-only `herdr.session_summary` Relay action.
 
 The bridge never reads pane output, cwd, environment, or terminal titles. It
 does not expose prompt, key-send, shell, or raw-socket controls.
+It discovers pane membership from periodic session snapshots rather than
+replaying Herdr's retained lifecycle-event history.
 
 ## Setup
 

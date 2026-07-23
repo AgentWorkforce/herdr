@@ -115,13 +115,10 @@ export async function subscribeToBridgeEvents(socketPath, paneIds, onEvent) {
   client.on('event', onEvent);
   try {
     await client.request('events.subscribe', {
-      subscriptions: [
-        { type: 'pane.created' },
-        { type: 'pane.closed' },
-        { type: 'pane.moved' },
-        { type: 'workspace.closed' },
-        ...[...new Set(paneIds)].map((pane_id) => ({ type: 'pane.agent_status_changed', pane_id })),
-      ],
+      subscriptions: [...new Set(paneIds)].map((pane_id) => ({
+        type: 'pane.agent_status_changed',
+        pane_id,
+      })),
     });
     return client;
   } catch (error) {
