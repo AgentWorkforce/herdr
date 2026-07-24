@@ -1,5 +1,11 @@
 import { rejectCredentialInput } from './command-runner.mjs';
 
+const ROOM_INVITATION_TOKEN_PATTERN = /^relay_room_inv_[A-Za-z0-9_-]{43}$/;
+
+export function isRoomInvitationToken(value) {
+  return typeof value === 'string' && ROOM_INVITATION_TOKEN_PATTERN.test(value);
+}
+
 function safeScalar(value, label) {
   if (!value || typeof value !== 'string' || value.includes('\0') || value.startsWith('-')) {
     throw new Error(`${label} must be a non-option value`);
@@ -21,11 +27,7 @@ function participantList(value) {
 }
 
 function privateInvitationToken(value) {
-  if (
-    typeof value !== 'string' ||
-    !/^herdr_inv_[A-Za-z0-9_-]+$/.test(value) ||
-    value.length > 2_048
-  ) {
+  if (!isRoomInvitationToken(value)) {
     throw new Error('room invitation token is invalid');
   }
   return value;
