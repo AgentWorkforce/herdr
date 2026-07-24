@@ -29,7 +29,12 @@ import {
   scopedRelaySession,
   tokenizeRoomCommand,
 } from '../dist/room-client.mjs';
-import { loadRoomState, roomStatePath } from '../dist/state.mjs';
+import {
+  bindRoomWorkspace,
+  claimRoomMount,
+  loadRoomState,
+  roomStatePath,
+} from '../dist/state.mjs';
 
 async function withTemporaryDirectory(run) {
   const directory = await mkdtemp(join(tmpdir(), 'herdr-relay-room-'));
@@ -643,6 +648,61 @@ test('accepts an invite before local workspace configuration and persists the re
         ).length,
         1
       );
+    } finally {
+      await created.room.close();
+    }
+  });
+});
+
+test('rejects non-public workspace IDs returned by invite acceptance', async () => {
+  await withTemporaryDirectory(async (directory) => {
+    const runner = fakeCli({
+      responses: {
+        'cloud room accept': {
+          membership: {
+            id: 'member-1',
+            workspaceId: 'rk_live_owner_secret',
+            role: 'participant',
+          },
+        },
+      },
+    });
+    const created = await createRoom(directory, { runner, config: null });
+    try {
+      await assert.rejects(
+        created.room.execute('room accept herdr_inv_untrusted_response'),
+        /valid public room workspace/
+      );
+      assert.equal(await loadRoomState(created.stateDir), undefined);
+    } finally {
+      await created.room.close();
+    }
+  });
+});
+
+test('stale mount recovery stops its recorded Relayfile workspace', async () => {
+  await withTemporaryDirectory(async (directory) => {
+    const stateDir = join(directory, 'state');
+    await bindRoomWorkspace(stateDir, 'rw_7ccfea89');
+    await claimRoomMount(stateDir, {
+      relayfileWorkspace: 'rw_oldspace',
+      checkoutPath: '/checkout',
+      mountPath: '/checkout/.integrations',
+    });
+    const runner = fakeCli();
+    const created = await createRoom(directory, {
+      runner,
+      config: {
+        workspaceId: 'rw_7ccfea89',
+        relayfileWorkspace: 'rw_newspace',
+      },
+    });
+    try {
+      const stop = runner.calls.find(
+        (call) => commandBase(call.args) === 'stop' && !call.args.includes('--help')
+      );
+      assert.deepEqual(stop.args, ['stop', 'rw_oldspace']);
+      assert.equal((await loadRoomState(stateDir)).relayfileMount.active, false);
     } finally {
       await created.room.close();
     }
