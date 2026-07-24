@@ -4,8 +4,14 @@ import { isAbsolute, join, relative, sep } from 'node:path';
 import { AgentRelay } from '@agent-relay/sdk';
 
 import { loadRoomConfig, pluginPaths } from './config.mjs';
-import { redactSensitiveText, rejectCredentialInput } from './command-runner.mjs';
+import {
+  redactSensitiveText,
+  sanitizeCliJson,
+} from './command-runner.mjs';
+import { parseRoomOperation, tokenizeRoomCommand } from './room-commands.mjs';
 import { FeatureDetectedRoomCli } from './room-cli.mjs';
+import { RelayEventDeduper } from './room-events.mjs';
+import { invokeRelaySdk, RELAY_SDK_OPERATIONS } from './room-sdk.mjs';
 import {
   acquireRoomLock,
   bindRoomWorkspace,
@@ -13,43 +19,19 @@ import {
   clearRoomSessionCleanup,
   clearRoomSessionIntent,
   deactivateRoomMount,
+  loadRoomState,
   markRoomSessionCleanup,
   setRoomSessionIntent,
 } from './state.mjs';
 
+export { RelayEventDeduper, relayEventIdentity } from './room-events.mjs';
+export { tokenizeRoomCommand } from './room-commands.mjs';
+
 const INTEGRATIONS_DIRECTORY = '.integrations';
-const CHAT_OPERATIONS = new Set([
-  'channel.history',
-  'message.send',
-  'thread.get',
-  'thread.reply',
-  'reaction.add',
-  'reaction.remove',
-  'presence',
-]);
 
 function isChildPath(root, target) {
   const offset = relative(root, target);
   return Boolean(offset) && !offset.startsWith(`..${sep}`) && offset !== '..' && !isAbsolute(offset);
-}
-
-function safeScalar(value, label) {
-  if (!value || typeof value !== 'string' || value.includes('\0') || value.startsWith('-')) {
-    throw new Error(`${label} must be a non-option value`);
-  }
-  rejectCredentialInput(value);
-  return value;
-}
-
-function privateInvitationToken(value) {
-  if (
-    typeof value !== 'string' ||
-    !/^herdr_inv_[A-Za-z0-9_-]+$/.test(value) ||
-    value.length > 2_048
-  ) {
-    throw new Error('room invitation token is invalid');
-  }
-  return value;
 }
 
 function parseContext(environment) {
@@ -168,61 +150,6 @@ export async function revalidateHerdrIntegrationsMount(
   }
 }
 
-export function tokenizeRoomCommand(line) {
-  const tokens = [];
-  let current = '';
-  let quote;
-  let escaped = false;
-  for (const character of String(line ?? '').trim()) {
-    if (escaped) {
-      current += character;
-      escaped = false;
-    } else if (character === '\\') {
-      escaped = true;
-    } else if (quote) {
-      if (character === quote) quote = undefined;
-      else current += character;
-    } else if (character === '"' || character === "'") {
-      quote = character;
-    } else if (/\s/.test(character)) {
-      if (current) {
-        tokens.push(current);
-        current = '';
-      }
-    } else {
-      current += character;
-    }
-  }
-  if (escaped || quote) throw new Error('Unclosed quote or escape in Relay Room command');
-  if (current) tokens.push(current);
-  return tokens;
-}
-
-function parseBackend(args) {
-  let backend;
-  const values = [];
-  let refresh = false;
-  for (let index = 0; index < args.length; index += 1) {
-    if (args[index] === '--backend') {
-      if (backend || index + 1 >= args.length) throw new Error('Use at most one --backend value');
-      backend = safeScalar(args[index + 1], 'backend');
-      if (!['nango', 'composio'].includes(backend)) {
-        throw new Error('backend must be nango or composio');
-      }
-      index += 1;
-    } else if (args[index] === '--refresh') {
-      refresh = true;
-    } else {
-      values.push(args[index]);
-    }
-  }
-  return {
-    values,
-    backendArgs: backend ? ['--backend', backend] : [],
-    refreshArgs: refresh ? ['--refresh'] : [],
-  };
-}
-
 function secureRelayUrl(value) {
   if (typeof value !== 'string') throw new Error('Room session did not return a Relaycast base URL');
   let url;
@@ -324,7 +251,23 @@ export function agentDiscoveryGuidance() {
 }
 
 function formatResult(value) {
-  return redactSensitiveText(JSON.stringify(value ?? { ok: true }, null, 2));
+  try {
+    return redactSensitiveText(
+      JSON.stringify(sanitizeCliJson(value ?? { ok: true }), null, 2)
+    );
+  } catch {
+    return JSON.stringify(
+      {
+        type:
+          typeof value?.type === 'string'
+            ? redactSensitiveText(value.type)
+            : 'unserializable-result',
+        detail: 'Relay returned a result that could not be rendered safely',
+      },
+      null,
+      2
+    );
+  }
 }
 
 export class RelayRoomController {
@@ -333,12 +276,17 @@ export class RelayRoomController {
     runner,
     operations,
     AgentRelayCtor = AgentRelay,
+    onEvent,
   } = {}) {
     const { configDir, stateDir } = pluginPaths(environment);
     const lock = await acquireRoomLock(stateDir);
     try {
-      const config = await loadRoomConfig(configDir);
-      const state = await bindRoomWorkspace(stateDir, config.workspaceId);
+      const config = await loadRoomConfig(configDir, { optional: true });
+      const existingState = await loadRoomState(stateDir);
+      const state = config.workspaceId
+        ? await bindRoomWorkspace(stateDir, config.workspaceId)
+        : existingState;
+      const workspaceId = config.workspaceId ?? state?.workspaceId;
       const cli = new FeatureDetectedRoomCli({
         runner,
         operations,
@@ -347,13 +295,14 @@ export class RelayRoomController {
       const controller = new RelayRoomController({
         environment,
         cli,
-        workspaceId: config.workspaceId,
-        relayfileWorkspace: config.relayfileWorkspace ?? config.workspaceId,
+        workspaceId,
+        relayfileWorkspace: config.relayfileWorkspace ?? workspaceId,
         stateDir,
-        sessionIntent: state.sessionIntent,
-        sessionCleanup: state.sessionCleanup,
-        relayfileMount: state.relayfileMount,
+        sessionIntent: state?.sessionIntent,
+        sessionCleanup: state?.sessionCleanup,
+        relayfileMount: state?.relayfileMount,
         AgentRelayCtor,
+        onEvent,
         lock,
       });
       await controller.recoverPersistedMount();
@@ -376,6 +325,7 @@ export class RelayRoomController {
     sessionCleanup,
     relayfileMount,
     AgentRelayCtor,
+    onEvent,
     lock,
   }) {
     this.environment = environment;
@@ -387,8 +337,12 @@ export class RelayRoomController {
     this.sessionCleanup = sessionCleanup;
     this.relayfileMount = relayfileMount;
     this.AgentRelayCtor = AgentRelayCtor;
+    this.onEvent = onEvent;
     this.lock = lock;
     this.relaySession = undefined;
+    this.eventUnsubscribe = undefined;
+    this.eventDeduper = new RelayEventDeduper();
+    this.eventSubscriptions = new Set();
     this.closed = false;
   }
 
@@ -427,8 +381,12 @@ export class RelayRoomController {
   async close() {
     if (this.closed) return;
     this.closed = true;
-    this.relaySession = undefined;
-    await this.lock?.release();
+    try {
+      await this.#disconnectRelayEvents();
+      this.relaySession = undefined;
+    } finally {
+      await this.lock?.release();
+    }
   }
 
   async execute(line) {
@@ -436,9 +394,13 @@ export class RelayRoomController {
     if (!command) return '';
     if (command === 'help') return this.help();
     if (command === 'guide') return agentDiscoveryGuidance();
-    const operation = this.#operationFor(command, args);
+    const operation = parseRoomOperation(command, args, {
+      workspaceId: this.workspaceId,
+      relayfileWorkspace: this.relayfileWorkspace,
+    });
 
     if (operation.name === 'room.reset-session') {
+      await this.#disconnectRelayEvents();
       this.relaySession = undefined;
       const deviceId = this.sessionIntent?.deviceId;
       if (deviceId) {
@@ -457,6 +419,8 @@ export class RelayRoomController {
     }
 
     if (operation.name === 'room.session') {
+      this.#requireWorkspace();
+      await this.#disconnectRelayEvents();
       this.relaySession = undefined;
       const deviceId = operation.args[1];
       const previousDeviceId = this.sessionIntent?.deviceId;
@@ -480,14 +444,45 @@ export class RelayRoomController {
       return `Full room participant session ready as ${this.relaySession.agentName}.`;
     }
 
-    if (CHAT_OPERATIONS.has(operation.name)) {
+    if (RELAY_SDK_OPERATIONS.has(operation.name)) {
       if (!this.relaySession) {
         throw new Error('Run room new-session <device-id> before using Relay chat');
       }
-      return formatResult(await this.#invokeSdk(operation));
+      if (operation.name === 'events.status') {
+        return formatResult({
+          connected: Boolean(this.eventUnsubscribe),
+          subscriptions: [...this.eventSubscriptions],
+        });
+      }
+      return formatResult(
+        await invokeRelaySdk(
+          this.relaySession.relay,
+          operation,
+          this.eventSubscriptions
+        )
+      );
+    }
+
+    if (operation.name === 'room.accept') {
+      if (this.workspaceId) {
+        throw new Error('Relay Room is already bound; accept invitations only from an unbound Room');
+      }
+      const result = await this.cli.invoke(operation.name, {
+        args: operation.args,
+        ...(operation.input !== undefined ? { input: operation.input } : {}),
+      });
+      const acceptedWorkspace = result.rawJson?.membership?.workspaceId;
+      if (typeof acceptedWorkspace !== 'string') {
+        throw new Error('Cloud did not return the accepted room workspace');
+      }
+      const state = await bindRoomWorkspace(this.stateDir, acceptedWorkspace);
+      this.workspaceId = state.workspaceId;
+      this.relayfileWorkspace ??= state.workspaceId;
+      return `Room invitation accepted and bound to ${state.workspaceId}. Run room new-session <device-id>.`;
     }
 
     if (operation.name === 'room.invite') {
+      this.#requireWorkspace();
       const result = await this.cli.invoke(operation.name, {
         args: operation.args,
         workspaceId: this.workspaceId,
@@ -515,35 +510,49 @@ export class RelayRoomController {
       ? await this.#invokeIntegration(operation.name, operation.args)
       : await this.cli.invoke(operation.name, {
           args: operation.args,
-          workspaceId: this.workspaceId,
+          workspaceId: this.#requireWorkspace(),
           ...(operation.input !== undefined ? { input: operation.input } : {}),
         });
     return result.safeOutput || formatResult(result.rawJson);
   }
 
-  async #invokeSdk(operation) {
-    const relay = this.relaySession.relay;
-    switch (operation.name) {
-      case 'channel.history':
-        return relay.messages.list(operation.channel);
-      case 'message.send':
-        return relay.messages.send({ channel: operation.channel, text: operation.text });
-      case 'thread.get':
-        return relay.messages.thread(operation.messageId);
-      case 'thread.reply':
-        return relay.messages.reply({
-          messageId: operation.messageId,
-          text: operation.text,
-        });
-      case 'reaction.add':
-        return relay.messages.react(operation.messageId, operation.emoji);
-      case 'reaction.remove':
-        await relay.messages.unreact(operation.messageId, operation.emoji);
-        return { ok: true };
-      case 'presence':
-        return relay.agents.presence();
-      default:
-        throw new Error('Unknown Relay SDK operation');
+  #requireWorkspace() {
+    if (!this.workspaceId) {
+      throw new Error(
+        'Relay Room is not bound yet. Accept an invitation with room accept <token>, or configure workspaceId.'
+      );
+    }
+    return this.workspaceId;
+  }
+
+  #connectRelayEvents() {
+    if (!this.onEvent || !this.relaySession || this.eventUnsubscribe) return;
+    const events = this.relaySession.relay.events;
+    this.eventUnsubscribe = events.on('any', (event) => {
+      if (this.eventDeduper.isDuplicate(event)) return;
+      try {
+        this.onEvent(formatResult(event));
+      } catch {
+        // Realtime display failures must not tear down the Relay SDK stream.
+      }
+    });
+    try {
+      events.connect();
+    } catch {
+      this.eventUnsubscribe?.();
+      this.eventUnsubscribe = undefined;
+    }
+  }
+
+  async #disconnectRelayEvents() {
+    const relay = this.relaySession?.relay;
+    const wasConnected = Boolean(this.eventUnsubscribe);
+    this.eventUnsubscribe?.();
+    this.eventUnsubscribe = undefined;
+    this.eventSubscriptions.clear();
+    this.eventDeduper.clear();
+    if (wasConnected && relay?.events?.disconnect) {
+      await relay.events.disconnect().catch(() => undefined);
     }
   }
 
@@ -573,6 +582,7 @@ export class RelayRoomController {
       this.sessionCleanup = undefined;
     }
     this.relaySession = relaySession;
+    this.#connectRelayEvents();
   }
 
   async #revokeRoomSession(deviceId) {
@@ -643,185 +653,16 @@ export class RelayRoomController {
     });
   }
 
-  #operationFor(command, args) {
-    if (command === 'history' && args.length === 1) {
-      return { name: 'channel.history', channel: safeScalar(args[0], 'channel') };
-    }
-    if (command === 'presence' && args.length === 0) return { name: 'presence' };
-    if (command === 'thread') {
-      if (args[0] === 'reply' && args.length >= 3) {
-        return {
-          name: 'thread.reply',
-          messageId: safeScalar(args[1], 'message id'),
-          text: args.slice(2).join(' '),
-        };
-      }
-      if (args.length === 1) {
-        return { name: 'thread.get', messageId: safeScalar(args[0], 'message id') };
-      }
-    }
-    if (command === 'message' && args[0] === 'send' && args.length >= 3) {
-      return {
-        name: 'message.send',
-        channel: safeScalar(args[1], 'channel'),
-        text: args.slice(2).join(' '),
-      };
-    }
-    if (command === 'reaction' && ['add', 'remove'].includes(args[0]) && args.length === 3) {
-      return {
-        name: `reaction.${args[0]}`,
-        messageId: safeScalar(args[1], 'message id'),
-        emoji: safeScalar(args[2], 'emoji'),
-      };
-    }
-    if (command === 'room') return this.#roomOperation(args);
-    if (command === 'integration') return this.#integrationOperation(args);
-    throw new Error('Unknown Relay Room command. Run help for the supported controls.');
-  }
-
-  #roomOperation(args) {
-    const [verb, ...values] = args;
-    if (['invites', 'members'].includes(verb) && values.length === 0) {
-      return { name: `room.${verb}`, args: [] };
-    }
-    if (verb === 'reset-session' && values.length === 0) {
-      return { name: 'room.reset-session', args: [] };
-    }
-    if (verb === 'new-session' && values.length === 1) {
-      return {
-        name: 'room.session',
-        args: ['--device-id', safeScalar(values[0], 'device id')],
-      };
-    }
-    if (verb === 'accept' && values.length === 1) {
-      return {
-        name: 'room.accept',
-        args: ['--token-stdin'],
-        input: privateInvitationToken(values[0]),
-      };
-    }
-    if (verb === 'invite' && values.length === 1) {
-      return {
-        name: 'room.invite',
-        args: ['--email', safeScalar(values[0], 'email')],
-      };
-    }
-    if (['revoke-invite', 'remove-member'].includes(verb) && values.length === 1) {
-      return { name: `room.${verb}`, args: [safeScalar(values[0], verb)] };
-    }
-    throw new Error(
-      'usage: room invite <email> | room revoke-invite|remove-member|accept <value> | room invites|members | room new-session <device-id> | room reset-session'
-    );
-  }
-
-  #integrationOperation(args) {
-    const [verb, ...rawValues] = args;
-    if (verb === 'available') {
-      const { values, backendArgs, refreshArgs } = parseBackend(rawValues);
-      if (values.length > 1) {
-        throw new Error('usage: integration available [query] [--backend name] [--refresh]');
-      }
-      return {
-        name: 'integration.available',
-        args: [
-          ...backendArgs,
-          ...refreshArgs,
-          ...(values.length ? ['--search', safeScalar(values[0], 'query')] : []),
-        ],
-      };
-    }
-    if (verb === 'search') {
-      const { values, backendArgs, refreshArgs } = parseBackend(rawValues);
-      if (values.length !== 1) {
-        throw new Error('usage: integration search <query> [--backend name] [--refresh]');
-      }
-      return {
-        name: 'integration.search',
-        args: [safeScalar(values[0], 'query'), ...backendArgs, ...refreshArgs],
-      };
-    }
-    if (verb === 'connect') {
-      const { values, backendArgs } = parseBackend(rawValues);
-      if (values.length !== 1) {
-        throw new Error('usage: integration connect <provider> [--backend name]');
-      }
-      return {
-        name: 'integration.connect',
-        args: [
-          safeScalar(values[0], 'provider'),
-          '--workspace',
-          this.relayfileWorkspace,
-          '--no-open',
-          ...backendArgs,
-        ],
-      };
-    }
-    if (verb === 'login' && rawValues.length === 0) {
-      return {
-        name: 'integration.login',
-        args: ['--no-open'],
-      };
-    }
-    if (verb === 'list' && rawValues.length === 0) {
-      return {
-        name: 'integration.list',
-        args: ['--workspace', this.relayfileWorkspace],
-      };
-    }
-    if (verb === 'disconnect' && rawValues.length === 1) {
-      return {
-        name: 'integration.disconnect',
-        args: [
-          safeScalar(rawValues[0], 'provider'),
-          '--workspace',
-          this.relayfileWorkspace,
-          '--yes',
-        ],
-      };
-    }
-    if (verb === 'setup') {
-      const { values, backendArgs } = parseBackend(rawValues);
-      if (values.length !== 1) {
-        throw new Error('usage: integration setup <provider> [--backend name]');
-      }
-      return {
-        name: 'integration.setup',
-        provider: safeScalar(values[0], 'provider'),
-        backendArgs,
-      };
-    }
-    if (verb === 'mount' && rawValues.length === 0) {
-      return { name: 'integration.mount' };
-    }
-    if (verb === 'stop' && rawValues.length === 0) {
-      return { name: 'integration.stop', args: [this.relayfileWorkspace] };
-    }
-    if (verb === 'status' && rawValues.length === 0) {
-      return { name: 'integration.status', args: [this.relayfileWorkspace] };
-    }
-    if (verb === 'writeback-status' && rawValues.length === 0) {
-      return {
-        name: 'integration.writeback-status',
-        args: [this.relayfileWorkspace],
-      };
-    }
-    if (verb === 'writeback-retry' && rawValues.length === 1) {
-      return {
-        name: 'integration.writeback-retry',
-        args: ['--opId', safeScalar(rawValues[0], 'operation id'), this.relayfileWorkspace],
-      };
-    }
-    throw new Error(
-      'usage: integration available|search|connect|disconnect|list|setup|mount|stop|status|writeback-status|writeback-retry ...'
-    );
-  }
-
   help() {
     return [
-      'Session: room new-session <device-id>; room reset-session.',
-      'Chat: history <#channel>; message send <#channel> <text>; thread <id>; thread reply <id> <text>; reaction add|remove <id> <emoji>; presence.',
+      'Session: room accept <token>; room new-session <device-id>; room reset-session.',
+      'Channels: channel list|get|create|update|archive|join|leave|invite|members|mute|unmute ...; history <#channel>.',
+      'Messages: message send|get|search|mark-read|readers|read-status|reactions ...; thread <id>; thread reply <id> <text>.',
+      'Direct: dm send <agent> <text>; dm history <conversation-id>; group create <agent,agent> [name]; group send <conversation-id> <text>.',
+      'Live: events status; events subscribe|unsubscribe <#channel...>; reaction add|remove <id> <emoji>; presence.',
       'Membership: room invite <email>; room invites; room members; room revoke-invite <id>; room remove-member <id>; room accept <token>.',
       'Relayfile: integration available [query]; integration search <query>; integration login; integration connect|disconnect <provider>; integration list.',
+      'Provider setup: integration adopt <provider> <connection-id>; integration set-metadata <provider> <key=value...>; integration resolve-path <provider> <resource>.',
       'Mounts: integration setup <provider>; integration mount; integration stop; integration status.',
       'Writebacks: integration writeback-status; integration writeback-retry <operation-id>.',
       'The Relayfile mirror is always <Herdr checkout>/.integrations.',

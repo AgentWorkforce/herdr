@@ -5,8 +5,16 @@ import { createCommandRunner, redactSensitiveText } from './command-runner.mjs';
 import { RelayRoomController } from './room-client.mjs';
 
 async function main() {
-  const room = await RelayRoomController.create({ runner: createCommandRunner() });
-  const terminal = readline.createInterface({ input: stdin, output: stdout, terminal: true });
+  let terminal;
+  const room = await RelayRoomController.create({
+    runner: createCommandRunner(),
+    onEvent: (event) => {
+      stdout.write(`\nRelay event:\n${event}\n`);
+      terminal?.prompt(true);
+    },
+  });
+  terminal = readline.createInterface({ input: stdin, output: stdout, terminal: true });
+  terminal.setPrompt('relay-room> ');
   let stopping = false;
   const stop = () => {
     if (stopping) return;
@@ -17,15 +25,10 @@ async function main() {
   process.once('SIGTERM', stop);
   if (process.platform !== 'win32') process.once('SIGHUP', stop);
   stdout.write('Relay Room ready. Start a chat session or configure Relayfile writeback. Type help for controls.\n');
+  terminal.prompt();
   try {
-    while (!stopping) {
-      let line;
-      try {
-        line = await terminal.question('relay-room> ');
-      } catch (error) {
-        if (stopping && error?.code === 'ERR_USE_AFTER_CLOSE') break;
-        throw error;
-      }
+    for await (const line of terminal) {
+      if (stopping) break;
       if (['exit', 'quit'].includes(line.trim().toLowerCase())) break;
       try {
         const output = await room.execute(line);
@@ -35,6 +38,7 @@ async function main() {
         // client, but redacting here keeps the terminal boundary fail-closed.
         stdout.write(`Error: ${redactSensitiveText(error?.message || 'Relay Room command failed')}\n`);
       }
+      if (!stopping) terminal.prompt();
     }
   } finally {
     terminal.close();

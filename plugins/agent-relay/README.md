@@ -59,8 +59,9 @@ Closing that pane stops the bridge. It does not run from a startup hook.
 ## Relay Room setup
 
 Relay Room has its own configuration and does not read the bridge's Relay
-workspace key. Copy `room.config.example.json` to the plugin configuration
-directory as `relay-room.json`, then replace the public workspace binding:
+workspace key. A room owner may copy `room.config.example.json` to the plugin
+configuration directory as `relay-room.json`, then replace the public
+workspace binding:
 
 ```bash
 cp /path/to/agent-relay/room.config.example.json \
@@ -69,10 +70,20 @@ chmod 600 "$(herdr plugin config-dir agent-relay.herdr-bridge)/relay-room.json"
 herdr plugin pane open --plugin agent-relay.herdr-bridge --entrypoint room --placement tab
 ```
 
+An invitee does not need to know or configure the workspace ID first. Open the
+Room pane without `relay-room.json`, accept the one-time invitation, and let
+Cloud's accepted membership bind the Room:
+
+```text
+room accept <token>
+room new-session <device-id>
+```
+
 `workspaceId` and optional `relayfileWorkspace` accept only a public `rw_…` ID
-or Cloud workspace UUID, never an `rk_live_...` workspace key. The first Room
-start persists that one binding in private plugin state and refuses an
-accidental switch to another Room.
+or Cloud workspace UUID, never an `rk_live_...` workspace key. The first
+explicit configuration or accepted invite persists that one binding in private
+plugin state. A bound Room refuses another invite so it cannot consume a token
+for a different workspace.
 
 Production leaves `apiUrl` out and uses the CLI's default Cloud endpoint. For a
 local or self-hosted proof, set a credential-free HTTPS endpoint (or loopback
@@ -94,8 +105,15 @@ agent-relay cloud room accept --token-stdin --json
 Every invited person is a trusted full room participant in v1. Cloud
 returns an ordinary Relaycast human agent token for the device. Relay Room
 constructs `AgentRelay` from `@agent-relay/sdk` with that token and calls the SDK
-directly for chat, threads, reactions, and presence. It does not shell out for
-chat and does not need any Relaycast or Relaycast Cloud change.
+directly for channels, DMs and group DMs, threads, reactions, search/read
+status, presence, and realtime events. It does not shell out for chat and does
+not need any Relaycast or Relaycast Cloud change.
+
+Realtime delivery starts with the participant session. The plugin adds a
+bounded, content-aware replay guard at its display boundary: only the same
+stable event identity with the same content is suppressed; changed or
+unidentifiable events are delivered. The SDK remains responsible for
+reconnection and transport fan-in.
 
 The participant credential lives only in memory. The non-secret device ID is
 saved so reopening the Room renews the session. Replacing or resetting the
@@ -113,12 +131,27 @@ in v1.
 room new-session <device-id>
 room reset-session
 history #channel
+channel list
+channel get|archive|join|leave|members|mute|unmute #channel
+channel create #channel ["topic"]
+channel update #channel "topic"
+channel invite #channel <agent>
 thread <message-id>
 presence
 
 message send #channel "text"
+message get <message-id>
+message search "query"
+message mark-read|readers|reactions <message-id>
+message read-status #channel
 thread reply <message-id> "text"
 reaction add|remove <message-id> <emoji>
+dm send <agent> "text"
+dm history <conversation-id>
+group create <agent,agent> [name]
+group send <conversation-id> "text"
+events status
+events subscribe|unsubscribe <#channel...>
 room invite <email>
 room invites|members
 room revoke-invite|remove-member|accept <value>
@@ -127,6 +160,9 @@ integration available [query] [--backend nango|composio] [--refresh]
 integration search <query> [--backend nango|composio] [--refresh]
 integration login
 integration connect|disconnect <provider> [--backend nango|composio]
+integration adopt <provider> <connection-id>
+integration set-metadata <provider> <key=value...>
+integration resolve-path <provider> <resource>
 integration list
 integration setup <provider> [--backend nango|composio]
 integration mount
