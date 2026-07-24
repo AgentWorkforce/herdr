@@ -62,6 +62,10 @@ function commandBase(args) {
   return args[0] ?? '';
 }
 
+function roomInvitationToken(character = 'A') {
+  return `relay_room_inv_${character.repeat(43)}`;
+}
+
 function fakeCli({ supported, responses = {} } = {}) {
   const calls = [];
   const counts = new Map();
@@ -543,7 +547,7 @@ test('uses the participant-only manual room invite contract', async () => {
             id: 'invite-1',
             email: 'person@example.com',
             role: 'participant',
-            token: 'herdr_inv_share_once',
+            token: roomInvitationToken(),
             expiresAt: '2026-07-30T00:00:00.000Z',
             createdAt: '2026-07-23T00:00:00.000Z',
           },
@@ -592,7 +596,7 @@ test('keeps invitation tokens out of argv when accepting', async () => {
     });
     const created = await createRoom(directory, { runner, config: null });
     try {
-      const token = 'herdr_inv_private_accept_value';
+      const token = roomInvitationToken('B');
       await created.room.execute(`room accept ${token}`);
       const execution = runner.calls.find(
         (call) => commandBase(call.args) === 'cloud room accept' && !call.args.includes('--help')
@@ -600,6 +604,35 @@ test('keeps invitation tokens out of argv when accepting', async () => {
       assert.deepEqual(execution.args, ['cloud', 'room', 'accept', '--token-stdin', '--json']);
       assert.equal(execution.input, token);
       assert.equal(execution.args.includes(token), false);
+    } finally {
+      await created.room.close();
+    }
+  });
+});
+
+test('rejects invitation tokens outside the Relay Room wire contract', async () => {
+  await withTemporaryDirectory(async (directory) => {
+    const runner = fakeCli();
+    const created = await createRoom(directory, { runner, config: null });
+    try {
+      for (const token of [
+        `product_inv_${'A'.repeat(43)}`,
+        `relay_room_inv_${'A'.repeat(42)}`,
+        `relay_room_inv_${'A'.repeat(44)}`,
+        `relay_room_inv_${'A'.repeat(42)}!`,
+      ]) {
+        await assert.rejects(
+          created.room.execute(`room accept ${token}`),
+          /room invitation token is invalid/
+        );
+      }
+      assert.equal(
+        runner.calls.filter(
+          (call) =>
+            commandBase(call.args) === 'cloud room accept' && !call.args.includes('--help')
+        ).length,
+        0
+      );
     } finally {
       await created.room.close();
     }
@@ -627,11 +660,11 @@ test('accepts an invite before local workspace configuration and persists the re
         /not bound yet/
       );
       assert.match(
-        await created.room.execute('room accept herdr_inv_private_bootstrap'),
+        await created.room.execute(`room accept ${roomInvitationToken('C')}`),
         /accepted and bound to rw_7ccfea89/
       );
       await assert.rejects(
-        created.room.execute('room accept herdr_inv_would_be_consumed'),
+        created.room.execute(`room accept ${roomInvitationToken('D')}`),
         /already bound/
       );
       await created.room.execute('room new-session invitee-device');
@@ -640,7 +673,7 @@ test('accepts an invite before local workspace configuration and persists the re
         (call) => commandBase(call.args) === 'cloud room accept' && !call.args.includes('--help')
       );
       assert.deepEqual(acceptance.args, ['cloud', 'room', 'accept', '--token-stdin', '--json']);
-      assert.equal(acceptance.input, 'herdr_inv_private_bootstrap');
+      assert.equal(acceptance.input, roomInvitationToken('C'));
       assert.equal(
         runner.calls.filter(
           (call) =>
@@ -670,7 +703,7 @@ test('rejects non-public workspace IDs returned by invite acceptance', async () 
     const created = await createRoom(directory, { runner, config: null });
     try {
       await assert.rejects(
-        created.room.execute('room accept herdr_inv_untrusted_response'),
+        created.room.execute(`room accept ${roomInvitationToken('E')}`),
         /valid public room workspace/
       );
       assert.equal(await loadRoomState(created.stateDir), undefined);
@@ -842,7 +875,12 @@ test('Relayfile inherits the user Cloud session but never ambient Relay credenti
 });
 
 test('redaction and tokenization keep credentials out of display and argv', () => {
-  assert.equal(redactSensitiveText('token=secret-value at_live_private'), '[redacted] [redacted]');
+  assert.equal(
+    redactSensitiveText(
+      `token=secret-value at_live_private invitation=${roomInvitationToken('F')}`
+    ),
+    '[redacted] [redacted] invitation=[redacted]'
+  );
   assert.doesNotMatch(
     parseCliOutput('{"token":"at_live_private","safe":"ok"}').safeOutput,
     /at_live_private/

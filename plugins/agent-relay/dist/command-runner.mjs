@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 
-const SECRET_VALUE = /(?:\b(?:rk|at|ot)_(?:live|test)_[A-Za-z0-9_-]+|\brelay_(?:pa|pr)_[A-Za-z0-9._~-]+|\bherdr_inv_[A-Za-z0-9_-]+|\b(?:sk|pk)_[A-Za-z0-9_-]+|\bBearer\s+[A-Za-z0-9._~-]+|\b(?:token|secret|password|api[_-]?key|workspace[_-]?key)\s*[:=]\s*[^\s,}\]]+)/gi;
+const SECRET_VALUE = /(?:\b(?:rk|at|ot)_(?:live|test)_[A-Za-z0-9_-]+|\brelay_(?:pa|pr)_[A-Za-z0-9._~-]+|\brelay_room_inv_[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])|\b(?:sk|pk)_[A-Za-z0-9_-]+|\bBearer\s+[A-Za-z0-9._~-]+|\b(?:token|secret|password|api[_-]?key|workspace[_-]?key)\s*[:=]\s*[^\s,}\]]+)/gi;
 const SECRET_FIELD = /(?:token|credential|secret|password|authorization|api[_-]?key|workspace[_-]?key)/i;
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 1_048_576;

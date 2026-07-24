@@ -12,7 +12,11 @@ import {
   redactSensitiveText,
   sanitizeCliJson,
 } from './command-runner.mjs';
-import { parseRoomOperation, tokenizeRoomCommand } from './room-commands.mjs';
+import {
+  isRoomInvitationToken,
+  parseRoomOperation,
+  tokenizeRoomCommand,
+} from './room-commands.mjs';
 import { FeatureDetectedRoomCli } from './room-cli.mjs';
 import { RelayEventDeduper } from './room-events.mjs';
 import { invokeRelaySdk, RELAY_SDK_OPERATIONS } from './room-sdk.mjs';
@@ -520,7 +524,7 @@ export class RelayRoomController {
         workspaceId: this.workspaceId,
       });
       const token = result.rawJson?.invite?.token;
-      if (typeof token !== 'string' || !/^herdr_inv_[A-Za-z0-9_-]+$/.test(token)) {
+      if (!isRoomInvitationToken(token)) {
         throw new Error('Cloud did not return a valid one-time room invitation token');
       }
       return `Full-participant invitation token (share securely): ${token}`;
