@@ -3,7 +3,11 @@ import { isAbsolute, join, relative, sep } from 'node:path';
 
 import { AgentRelay } from '@agent-relay/sdk';
 
-import { loadRoomConfig, pluginPaths } from './config.mjs';
+import {
+  loadRoomConfig,
+  pluginPaths,
+  PublicWorkspaceIdSchema,
+} from './config.mjs';
 import {
   redactSensitiveText,
   sanitizeCliJson,
@@ -393,7 +397,10 @@ export class RelayRoomController {
   async recoverPersistedMount() {
     if (!this.relayfileMount?.active) return;
     try {
-      await this.#invokeIntegration('integration.stop', [this.relayfileWorkspace]);
+      await this.#invokeIntegration(
+        'integration.stop',
+        [this.relayfileMount.relayfileWorkspace]
+      );
       await deactivateRoomMount(this.stateDir, this.relayfileMount);
       this.relayfileMount = { ...this.relayfileMount, active: false };
     } catch {
@@ -494,11 +501,13 @@ export class RelayRoomController {
         args: operation.args,
         ...(operation.input !== undefined ? { input: operation.input } : {}),
       });
-      const acceptedWorkspace = result.rawJson?.membership?.workspaceId;
-      if (typeof acceptedWorkspace !== 'string') {
-        throw new Error('Cloud did not return the accepted room workspace');
+      const acceptedWorkspace = PublicWorkspaceIdSchema.safeParse(
+        result.rawJson?.membership?.workspaceId
+      );
+      if (!acceptedWorkspace.success) {
+        throw new Error('Cloud did not return a valid public room workspace');
       }
-      const state = await bindRoomWorkspace(this.stateDir, acceptedWorkspace);
+      const state = await bindRoomWorkspace(this.stateDir, acceptedWorkspace.data);
       this.workspaceId = state.workspaceId;
       this.relayfileWorkspace ??= state.workspaceId;
       return `Room invitation accepted and bound to ${state.workspaceId}. Run room new-session <device-id>.`;

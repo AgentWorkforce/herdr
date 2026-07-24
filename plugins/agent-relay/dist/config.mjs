@@ -39,7 +39,7 @@ const roomApiUrl = relayBaseUrl.superRefine((value, context) => {
   }
 });
 
-const publicWorkspaceId = z
+export const PublicWorkspaceIdSchema = z
   .string()
   .trim()
   .regex(
@@ -64,8 +64,8 @@ export const BridgeConfigSchema = z
 // workspace key or a Cloud/API credential.
 export const RoomConfigSchema = z
   .object({
-    workspaceId: publicWorkspaceId.optional(),
-    relayfileWorkspace: publicWorkspaceId.optional(),
+    workspaceId: PublicWorkspaceIdSchema.optional(),
+    relayfileWorkspace: PublicWorkspaceIdSchema.optional(),
     apiUrl: roomApiUrl.optional(),
   })
   .refine((config) => !config.relayfileWorkspace || config.workspaceId, {

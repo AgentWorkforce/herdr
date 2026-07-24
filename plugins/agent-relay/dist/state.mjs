@@ -4,6 +4,8 @@ import { join } from 'node:path';
 
 import { z } from 'zod';
 
+import { PublicWorkspaceIdSchema } from './config.mjs';
+
 const TransitionSchema = z.object({
   fingerprint: z.string().min(1),
   sequence: z.number().int().positive(),
@@ -18,7 +20,7 @@ const BridgeStateSchema = z
 
 const RelayfileMountSchema = z
   .object({
-    relayfileWorkspace: z.string().min(1),
+    relayfileWorkspace: PublicWorkspaceIdSchema,
     checkoutPath: z.string().min(1),
     mountPath: z.string().min(1),
     active: z.boolean().default(false),
@@ -41,7 +43,7 @@ const RoomSessionCleanupSchema = z
 
 const RoomStateSchema = z
   .object({
-    workspaceId: z.string().min(1),
+    workspaceId: PublicWorkspaceIdSchema,
     sessionIntent: RoomSessionIntentSchema.optional(),
     sessionCleanup: RoomSessionCleanupSchema.optional(),
     relayfileMount: RelayfileMountSchema.optional(),
