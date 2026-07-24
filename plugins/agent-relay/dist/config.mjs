@@ -64,9 +64,12 @@ export const BridgeConfigSchema = z
 // workspace key or a Cloud/API credential.
 export const RoomConfigSchema = z
   .object({
-    workspaceId: publicWorkspaceId,
+    workspaceId: publicWorkspaceId.optional(),
     relayfileWorkspace: publicWorkspaceId.optional(),
     apiUrl: roomApiUrl.optional(),
+  })
+  .refine((config) => !config.relayfileWorkspace || config.workspaceId, {
+    message: 'relayfileWorkspace requires workspaceId',
   })
   .strict();
 
@@ -99,14 +102,17 @@ export async function loadBridgeConfig(configDir) {
   return loadConfigFile(configPath(configDir), BridgeConfigSchema, 'Agent Relay bridge');
 }
 
-export async function loadRoomConfig(configDir) {
-  return loadConfigFile(roomConfigPath(configDir), RoomConfigSchema, 'Relay Room');
+export async function loadRoomConfig(configDir, { optional = false } = {}) {
+  return loadConfigFile(roomConfigPath(configDir), RoomConfigSchema, 'Relay Room', {
+    optional,
+  });
 }
 
-async function loadConfigFile(path, schema, displayName) {
+async function loadConfigFile(path, schema, displayName, { optional = false } = {}) {
   try {
     await assertPrivateConfigFile(path);
   } catch (error) {
+    if (optional && error?.code === 'ENOENT') return {};
     if (!error?.code) throw error;
     throw new Error(`Cannot read ${displayName} configuration at ${path}`);
   }

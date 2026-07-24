@@ -22,6 +22,7 @@ import {
 } from '../dist/command-runner.mjs';
 import {
   RelayRoomController,
+  RelayEventDeduper,
   agentDiscoveryGuidance,
   prepareHerdrIntegrationsMount,
   revalidateHerdrIntegrationsMount,
@@ -73,6 +74,9 @@ function fakeCli({ supported, responses = {} } = {}) {
       'integration search',
       'integration connect',
       'integration disconnect',
+      'integration adopt',
+      'integration set-metadata',
+      'integration resolve-path',
       'integration list',
       'login',
       'mount',
@@ -116,17 +120,51 @@ function fakeRelayConstructor() {
       this.messages = {
         list: async (channel) => this.#record('messages.list', { channel }),
         send: async (input) => this.#record('messages.send', input),
-        thread: async (messageId) => this.#record('messages.thread', { messageId }),
-        reply: async (input) => this.#record('messages.reply', input),
+        get: async (messageId) => this.#record('messages.get', { messageId }),
+        search: async (query) => this.#record('messages.search', { query }),
+        direct: async (input) => this.#record('messages.direct', input),
+        listDirect: async (input) => this.#record('messages.listDirect', input),
+        createGroupDirect: async (input) =>
+          this.#record('messages.createGroupDirect', input),
+        groupDirect: async (input) => this.#record('messages.groupDirect', input),
+        markRead: async (messageId) => this.#record('messages.markRead', { messageId }),
+        readers: async (messageId) => this.#record('messages.readers', { messageId }),
+        readStatus: async (channel) => this.#record('messages.readStatus', { channel }),
+        reactions: async (messageId) => this.#record('messages.reactions', { messageId }),
         react: async (messageId, emoji) =>
           this.#record('messages.react', { messageId, emoji }),
         unreact: async (messageId, emoji) =>
           this.#record('messages.unreact', { messageId, emoji }),
       };
+      this.threads = {
+        get: async (messageId) => this.#record('threads.get', { messageId }),
+        reply: async (input) => this.#record('threads.reply', input),
+      };
+      this.channels = Object.fromEntries(
+        ['list', 'get', 'create', 'update', 'archive', 'join', 'leave', 'invite', 'members', 'mute', 'unmute'].map(
+          (name) => [name, async (...args) => this.#record(`channels.${name}`, args)]
+        )
+      );
       this.agents = {
         presence: async () => this.#record('agents.presence', {}),
       };
+      this.eventHandlers = new Set();
+      this.events = {
+        connect: () => this.#record('events.connect', {}),
+        disconnect: async () => this.#record('events.disconnect', {}),
+        subscribe: (channels) => this.#record('events.subscribe', { channels }),
+        unsubscribe: (channels) => this.#record('events.unsubscribe', { channels }),
+        on: (type, handler) => {
+          assert.equal(type, 'any');
+          this.eventHandlers.add(handler);
+          return () => this.eventHandlers.delete(handler);
+        },
+      };
       instances.push(this);
+    }
+
+    emit(event) {
+      for (const handler of this.eventHandlers) handler(event);
     }
 
     #record(name, input) {
@@ -144,10 +182,14 @@ const participantSession = {
   agentToken: 'at_live_participant_scoped_value',
 };
 
-async function createRoom(directory, { runner, config, context, AgentRelayCtor } = {}) {
+async function createRoom(
+  directory,
+  { runner, config, context, AgentRelayCtor, onEvent } = {}
+) {
   const configDir = join(directory, 'config');
   const stateDir = join(directory, 'state');
-  await writeRoomConfig(configDir, config);
+  if (config !== null) await writeRoomConfig(configDir, config);
+  else await mkdir(configDir, { recursive: true });
   const environment = {
     HERDR_PLUGIN_CONFIG_DIR: configDir,
     HERDR_PLUGIN_STATE_DIR: stateDir,
@@ -161,6 +203,7 @@ async function createRoom(directory, { runner, config, context, AgentRelayCtor }
       environment,
       runner: runner ?? fakeCli({ responses: { 'cloud room session': participantSession } }),
       AgentRelayCtor: relay.AgentRelayCtor ?? relay.FakeAgentRelay,
+      onEvent,
     }),
     environment,
     stateDir,
@@ -174,11 +217,18 @@ async function makeCheckout(directory) {
   return checkout;
 }
 
-test('requires one public workspace binding in a private config file', async () => {
+test('accepts only public workspace bindings and permits invite-first bootstrap', async () => {
   assert.equal(RoomConfigSchema.safeParse({ workspaceId: 'rk_live_secret' }).success, false);
   assert.equal(RoomConfigSchema.safeParse({ workspaceId: 'rw_7ccfea89' }).success, true);
+  assert.equal(RoomConfigSchema.safeParse({}).success, true);
+  assert.equal(
+    RoomConfigSchema.safeParse({ relayfileWorkspace: 'rw_7ccfea89' }).success,
+    false
+  );
   await withTemporaryDirectory(async (directory) => {
     const configDir = join(directory, 'config');
+    await mkdir(configDir);
+    assert.deepEqual(await loadRoomConfig(configDir, { optional: true }), {});
     await writeRoomConfig(configDir);
     assert.equal((await loadRoomConfig(configDir)).workspaceId, 'rw_7ccfea89');
     if (process.platform !== 'win32') {
@@ -274,8 +324,8 @@ test('routes chat entirely through the Agent Relay SDK', async () => {
         [
           'messages.list',
           'messages.send',
-          'messages.thread',
-          'messages.reply',
+          'threads.get',
+          'threads.reply',
           'messages.react',
           'messages.unreact',
           'agents.presence',
@@ -297,6 +347,104 @@ test('routes chat entirely through the Agent Relay SDK', async () => {
       await created.room.close();
     }
   });
+});
+
+test('exposes trusted participant channels, DMs, search, reads, and live events', async () => {
+  await withTemporaryDirectory(async (directory) => {
+    const delivered = [];
+    const created = await createRoom(directory, {
+      onEvent: (event) => delivered.push(event),
+    });
+    try {
+      await created.room.execute('room new-session multiplayer-device');
+      await created.room.execute('channel list');
+      await created.room.execute('channel create #planning "Launch planning"');
+      await created.room.execute('channel join #planning');
+      await created.room.execute('channel invite #planning api-worker');
+      await created.room.execute('channel members #planning');
+      await created.room.execute('dm send api-worker "take the API"');
+      await created.room.execute('dm history dm-conversation');
+      await created.room.execute('group create api-worker,ui-worker delivery');
+      await created.room.execute('group send group-conversation "ship together"');
+      await created.room.execute('message get message-1');
+      await created.room.execute('message search "workspace handoff"');
+      await created.room.execute('message mark-read message-1');
+      await created.room.execute('message readers message-1');
+      await created.room.execute('message read-status #planning');
+      await created.room.execute('message reactions message-1');
+      await created.room.execute('events subscribe #planning #general');
+      await created.room.execute('events unsubscribe #general');
+
+      const relay = created.relay.instances[0];
+      assert.deepEqual(
+        relay.calls.map((call) => call.name),
+        [
+          'events.connect',
+          'channels.list',
+          'channels.create',
+          'channels.join',
+          'channels.invite',
+          'channels.members',
+          'messages.direct',
+          'messages.listDirect',
+          'messages.createGroupDirect',
+          'messages.groupDirect',
+          'messages.get',
+          'messages.search',
+          'messages.markRead',
+          'messages.readers',
+          'messages.readStatus',
+          'messages.reactions',
+          'events.subscribe',
+          'events.unsubscribe',
+        ]
+      );
+
+      relay.emit({
+        type: 'messageCreated',
+        channel: '#planning',
+        message: { id: 'message-2', text: 'first' },
+      });
+      relay.emit({
+        type: 'messageCreated',
+        channel: '#planning',
+        message: { id: 'message-2', text: 'first' },
+      });
+      relay.emit({
+        type: 'messageCreated',
+        channel: '#planning',
+        message: { id: 'message-2', text: 'edited' },
+      });
+      assert.equal(delivered.length, 2);
+      assert.match(delivered[1], /edited/);
+      assert.match(await created.room.execute('events status'), /#planning/);
+    } finally {
+      await created.room.close();
+    }
+  });
+});
+
+test('event dedupe drops only identical stable events and delivers uncertain events', () => {
+  const dedupe = new RelayEventDeduper(2);
+  const original = {
+    type: 'dmReceived',
+    conversationId: 'conversation-1',
+    message: { id: 'message-1', text: 'hello' },
+  };
+  assert.equal(dedupe.isDuplicate(original), false);
+  assert.equal(dedupe.isDuplicate(structuredClone(original)), true);
+  assert.equal(
+    dedupe.isDuplicate({
+      ...original,
+      message: { id: 'message-1', text: 'changed' },
+    }),
+    false
+  );
+  assert.equal(dedupe.isDuplicate({ type: 'connected' }), false);
+  assert.equal(dedupe.isDuplicate({ type: 'connected' }), false);
+  const cyclic = { type: 'messageCreated', message: { id: 'cyclic-message' } };
+  cyclic.self = cyclic;
+  assert.equal(dedupe.isDuplicate(cyclic), false);
 });
 
 test('persists only device intent and renews it into memory on restart', async () => {
@@ -426,8 +574,18 @@ test('uses the participant-only manual room invite contract', async () => {
 
 test('keeps invitation tokens out of argv when accepting', async () => {
   await withTemporaryDirectory(async (directory) => {
-    const runner = fakeCli();
-    const created = await createRoom(directory, { runner });
+    const runner = fakeCli({
+      responses: {
+        'cloud room accept': {
+          membership: {
+            id: 'member-1',
+            workspaceId: 'rw_7ccfea89',
+            role: 'participant',
+          },
+        },
+      },
+    });
+    const created = await createRoom(directory, { runner, config: null });
     try {
       const token = 'herdr_inv_private_accept_value';
       await created.room.execute(`room accept ${token}`);
@@ -437,6 +595,54 @@ test('keeps invitation tokens out of argv when accepting', async () => {
       assert.deepEqual(execution.args, ['cloud', 'room', 'accept', '--token-stdin', '--json']);
       assert.equal(execution.input, token);
       assert.equal(execution.args.includes(token), false);
+    } finally {
+      await created.room.close();
+    }
+  });
+});
+
+test('accepts an invite before local workspace configuration and persists the returned binding', async () => {
+  await withTemporaryDirectory(async (directory) => {
+    const runner = fakeCli({
+      responses: {
+        'cloud room accept': {
+          membership: {
+            id: 'member-1',
+            workspaceId: 'rw_7ccfea89',
+            role: 'participant',
+          },
+        },
+        'cloud room session': participantSession,
+      },
+    });
+    const created = await createRoom(directory, { runner, config: null });
+    try {
+      await assert.rejects(
+        created.room.execute('room new-session invitee-device'),
+        /not bound yet/
+      );
+      assert.match(
+        await created.room.execute('room accept herdr_inv_private_bootstrap'),
+        /accepted and bound to rw_7ccfea89/
+      );
+      await assert.rejects(
+        created.room.execute('room accept herdr_inv_would_be_consumed'),
+        /already bound/
+      );
+      await created.room.execute('room new-session invitee-device');
+      assert.equal((await loadRoomState(created.stateDir)).workspaceId, 'rw_7ccfea89');
+      const acceptance = runner.calls.find(
+        (call) => commandBase(call.args) === 'cloud room accept' && !call.args.includes('--help')
+      );
+      assert.deepEqual(acceptance.args, ['cloud', 'room', 'accept', '--token-stdin', '--json']);
+      assert.equal(acceptance.input, 'herdr_inv_private_bootstrap');
+      assert.equal(
+        runner.calls.filter(
+          (call) =>
+            commandBase(call.args) === 'cloud room accept' && !call.args.includes('--help')
+        ).length,
+        1
+      );
     } finally {
       await created.room.close();
     }
@@ -453,6 +659,9 @@ test('uses Relayfile live catalog and connections without room grants or leases'
       await created.room.execute('integration login');
       await created.room.execute('integration connect notion --backend nango');
       await created.room.execute('integration list');
+      await created.room.execute('integration adopt salesforce connection-123');
+      await created.room.execute('integration set-metadata jira site=example.atlassian.net project=ENG');
+      await created.room.execute('integration resolve-path jira ENG-123');
       await created.room.execute('integration disconnect notion');
       await created.room.execute('integration writeback-status');
       await created.room.execute('integration writeback-retry op-123');
@@ -465,6 +674,9 @@ test('uses Relayfile live catalog and connections without room grants or leases'
         ['relayfile', ['login', '--no-open']],
         ['relayfile', ['integration', 'connect', 'notion', '--workspace', 'rw_7ccfea89', '--no-open', '--backend', 'nango']],
         ['relayfile', ['integration', 'list', '--workspace', 'rw_7ccfea89', '--json']],
+        ['relayfile', ['integration', 'adopt', 'salesforce', '--connection-id', 'connection-123', '--workspace', 'rw_7ccfea89', '--yes']],
+        ['relayfile', ['integration', 'set-metadata', 'jira', 'site=example.atlassian.net', 'project=ENG', '--workspace', 'rw_7ccfea89', '--yes']],
+        ['relayfile', ['integration', 'resolve-path', 'jira', 'ENG-123', '--json']],
         ['relayfile', ['integration', 'disconnect', 'notion', '--workspace', 'rw_7ccfea89', '--yes']],
         ['relayfile', ['writeback', 'status', 'rw_7ccfea89', '--json']],
         ['relayfile', ['writeback', 'retry', '--opId', 'op-123', 'rw_7ccfea89']],
