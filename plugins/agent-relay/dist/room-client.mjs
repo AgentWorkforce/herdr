@@ -47,7 +47,22 @@ function parseContext(environment) {
 }
 
 function sameIdentity(left, right) {
-  return left.dev === right.dev && left.ino === right.ino;
+  return (
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.ctimeMs === right.ctimeMs &&
+    left.birthtimeMs === right.birthtimeMs
+  );
+}
+
+function sameGeneration(left, right) {
+  return (
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    (!left.birthtimeMs ||
+      !right.birthtimeMs ||
+      left.birthtimeMs === right.birthtimeMs)
+  );
 }
 
 async function requirePlainDirectory(path, label, filesystem) {
@@ -118,11 +133,19 @@ export async function prepareHerdrIntegrationsMount(
   if (entries.length > 0 && !owned) {
     throw new Error('Relayfile refuses to mount over a non-empty source directory');
   }
+  const preparedCheckoutIdentity = await requirePlainDirectory(
+    checkoutPath,
+    'Herdr checkout',
+    filesystem
+  );
+  if (!sameGeneration(checkoutIdentity, preparedCheckoutIdentity)) {
+    throw new Error('Herdr checkout changed during Relayfile mount preparation');
+  }
   return {
     checkoutPath,
     mountPath,
     created,
-    checkoutIdentity,
+    checkoutIdentity: preparedCheckoutIdentity,
     mountIdentity,
   };
 }
