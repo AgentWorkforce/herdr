@@ -29,6 +29,24 @@ const relayBaseUrl = z
     }
   });
 
+const roomApiUrl = relayBaseUrl.superRefine((value, context) => {
+  const url = new URL(value);
+  if (url.search || url.hash) {
+    context.addIssue({
+      code: 'custom',
+      message: 'apiUrl must not contain query, fragment, or credential material',
+    });
+  }
+});
+
+export const PublicWorkspaceIdSchema = z
+  .string()
+  .trim()
+  .regex(
+    /^(?:rw_[a-z0-9]{8}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i,
+    { message: 'workspaceId must be a public rw_ identifier or UUID' }
+  );
+
 export const BridgeConfigSchema = z
   .object({
     workspaceKey: z.string().trim().min(1),
@@ -38,6 +56,20 @@ export const BridgeConfigSchema = z
       .array(z.string().trim().min(1))
       .min(1)
       .refine((ids) => new Set(ids).size === ids.length, 'workspaceIds must not contain duplicates'),
+  })
+  .strict();
+
+// The room deliberately uses a separate configuration file from the status
+// bridge. A room binding is a public workspace identifier, never an rk_live
+// workspace key or a Cloud/API credential.
+export const RoomConfigSchema = z
+  .object({
+    workspaceId: PublicWorkspaceIdSchema.optional(),
+    relayfileWorkspace: PublicWorkspaceIdSchema.optional(),
+    apiUrl: roomApiUrl.optional(),
+  })
+  .refine((config) => !config.relayfileWorkspace || config.workspaceId, {
+    message: 'relayfileWorkspace requires workspaceId',
   })
   .strict();
 
@@ -54,21 +86,35 @@ export function configPath(configDir) {
   return join(configDir, 'agent-relay.json');
 }
 
+export function roomConfigPath(configDir) {
+  return join(configDir, 'relay-room.json');
+}
+
 async function assertPrivateConfigFile(path) {
   const metadata = await stat(path);
-  if (!metadata.isFile()) throw new Error('Agent Relay bridge configuration must be a regular file');
+  if (!metadata.isFile()) throw new Error('Agent Relay plugin configuration must be a regular file');
   if (process.platform !== 'win32' && (metadata.mode & 0o077) !== 0) {
-    throw new Error('Agent Relay bridge configuration must not be accessible by group or other users');
+    throw new Error('Agent Relay plugin configuration must not be accessible by group or other users');
   }
 }
 
 export async function loadBridgeConfig(configDir) {
-  const path = configPath(configDir);
+  return loadConfigFile(configPath(configDir), BridgeConfigSchema, 'Agent Relay bridge');
+}
+
+export async function loadRoomConfig(configDir, { optional = false } = {}) {
+  return loadConfigFile(roomConfigPath(configDir), RoomConfigSchema, 'Relay Room', {
+    optional,
+  });
+}
+
+async function loadConfigFile(path, schema, displayName, { optional = false } = {}) {
   try {
     await assertPrivateConfigFile(path);
   } catch (error) {
+    if (optional && error?.code === 'ENOENT') return {};
     if (!error?.code) throw error;
-    throw new Error(`Cannot read Agent Relay bridge configuration at ${path}`);
+    throw new Error(`Cannot read ${displayName} configuration at ${path}`);
   }
 
   let parsed;
@@ -76,18 +122,26 @@ export async function loadBridgeConfig(configDir) {
     parsed = JSON.parse(await readFile(path, 'utf8'));
   } catch (error) {
     if (error instanceof SyntaxError) {
-      throw new Error('Agent Relay bridge configuration is not valid JSON');
+      throw new Error(`${displayName} configuration is not valid JSON`);
     }
-    throw new Error(`Cannot read Agent Relay bridge configuration at ${configPath(configDir)}`);
+    throw new Error(`Cannot read ${displayName} configuration at ${path}`);
   }
 
-  const result = BridgeConfigSchema.safeParse(parsed);
+  const result = schema.safeParse(parsed);
   if (!result.success) {
-    throw new Error('Agent Relay bridge configuration is invalid');
+    throw new Error(`${displayName} configuration is invalid`);
   }
   return result.data;
 }
 
 export function redactConfig(config) {
   return { ...config, workspaceKey: '[redacted]' };
+}
+
+export function redactRoomConfig(config) {
+  return {
+    workspaceId: '[bound]',
+    ...(config.relayfileWorkspace ? { relayfileWorkspace: '[bound]' } : {}),
+    ...(config.apiUrl ? { apiUrl: '[configured]' } : {}),
+  };
 }

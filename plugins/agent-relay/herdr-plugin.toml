@@ -13,3 +13,9 @@ id = "bridge"
 title = "Agent Relay bridge"
 placement = "tab"
 command = ["node", "dist/bridge.mjs"]
+
+[[panes]]
+id = "room"
+title = "Relay Room"
+placement = "tab"
+command = ["node", "dist/room.mjs"]
