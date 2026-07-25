@@ -1,0 +1,6 @@
+{
+  "workspaceKey": "rk_live_replace_me",
+  "baseUrl": "https://gateway.relaycast.dev",
+  "channel": "#agent-status",
+  "workspaceIds": ["w1"]
+}

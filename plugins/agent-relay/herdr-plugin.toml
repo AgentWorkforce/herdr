@@ -1,0 +1,15 @@
+id = "agent-relay.herdr-bridge"
+name = "Agent Relay bridge"
+version = "0.1.0"
+min_herdr_version = "0.7.5"
+description = "Forward selected Herdr agent status changes to Agent Relay."
+platforms = ["linux", "macos", "windows"]
+
+[[build]]
+command = ["npm", "ci", "--omit=dev"]
+
+[[panes]]
+id = "bridge"
+title = "Agent Relay bridge"
+placement = "tab"
+command = ["node", "dist/bridge.mjs"]
